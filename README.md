@@ -38,6 +38,7 @@ and the tables will be saved to `data/08_reporting/profiling/` directory by defa
 ```
 kedro>=0.18.5 # Minimal version for hook specifications
 pandas>=1.0.0
+humanize>=4.0.0
 ```
 
 # Get Started
@@ -106,9 +107,11 @@ The plugin generates two CSV files when `save_file=True`:
 
 Both files include:
 
-- Load/Save counts
-- Loading/Saving times
-- Total time calculations
+- Execution order (Node Profile)
+- Load/Save counts (Dataset Profile)
+- Loading/Saving times and node compute times
+- Total time calculations in seconds and human-readable `Total Time`
+- `TOTAL` and `Time Elapsed` (wall-clock duration) summary rows in console output (useful with `ThreadRunner`)
 - Sorted by total time (descending)
 
 ## Environment Variables
