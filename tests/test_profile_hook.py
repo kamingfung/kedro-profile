@@ -924,3 +924,28 @@ def test_rich_table_with_summary_rows_formats_every_numeric_column() -> None:
     assert list(columns[NODE_RUN_TIME]._cells) == ["2.00", "1.50", "3.50", ""]
     assert list(columns[EXECUTION_ORDER]._cells) == ["1", "2", "", ""]
     assert list(columns[TOTAL_TIME]._cells) == ["3.00", "2.00", "5.00", "4.00"]
+
+
+def test_csv_files_exclude_humanized_total_time() -> None:
+    """Total Time (humanized text) is console-only; CSVs keep Total Time(s)."""
+    # Arrange
+    hook = ProfileHook(save_file=True)
+    hook._node_starts["test_node"] = 1.0
+    hook._node_durations["test_node"] = 1.5
+    hook._load_durations[("test_dataset", "test_node")] = 0.5
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        hook.node_profile_path = Path(temp_dir) / "nodes.csv"
+        hook.dataset_profile_path = Path(temp_dir) / "datasets.csv"
+
+        # Act
+        with patch("builtins.print"):
+            hook.after_pipeline_run(
+                run_params={}, run_result=Mock(), pipeline=Mock(), catalog=Mock()
+            )
+
+        # Assert
+        for path in (hook.node_profile_path, hook.dataset_profile_path):
+            saved = pd.read_csv(path)
+            assert TOTAL_TIME in saved.columns
+            assert "Total Time" not in saved.columns

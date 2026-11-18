@@ -100,7 +100,7 @@ class ProfileHook:
         return id(self)
 
     def _save_to_csv(self, df: pd.DataFrame, file_path: str | Path) -> None:
-        """Save DataFrame to CSV file.
+        """Save DataFrame to CSV file, without the console-only Total Time text.
 
         Args:
             df: DataFrame containing profiling data to save.
@@ -109,7 +109,9 @@ class ProfileHook:
         try:
             # Ensure the directory exists
             Path(file_path).parent.mkdir(parents=True, exist_ok=True)
-            df.to_csv(file_path, index=False)
+            df.drop(columns=["Total Time"], errors="ignore").to_csv(
+                file_path, index=False
+            )
         except Exception as e:
             print(f"Failed to save profile data to {file_path}: {e}")
 
