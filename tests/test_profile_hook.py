@@ -48,6 +48,7 @@ from kedro_profile.hook import (
     TOTAL_TIME,
     ProfileHook,
     _build_dataset_table,
+    _add_total_row,
     _build_node_table,
     dataframe_to_rich_table,
     print_rich_table_to_console,
@@ -875,3 +876,23 @@ def test_second_run_starts_fresh() -> None:
     # Assert
     assert hook._collect_profiles() == ({}, {})
     assert time.time() - hook._pipeline_start < 5
+
+
+def test_unfinished_node_has_no_compute_time_and_stays_out_of_total() -> None:
+    """A node that started but never finished shows NaN and adds nothing."""
+    # Arrange
+    hook = ProfileHook()
+    hook._node_starts["done"] = 1_700_000_000.0
+    hook._node_durations["done"] = 2.0
+    hook._node_starts["failed"] = 1_700_000_001.0  # no duration recorded
+
+    # Act
+    node_profile, _ = hook._collect_profiles()
+    node_df = _build_node_table(dictionary=node_profile, index_name="Node Name")
+    with_total = _add_total_row(node_df, "Node Name")
+
+    # Assert
+    failed_row = with_total[with_total["Node Name"] == "failed"].iloc[0]
+    total_row = with_total[with_total["Node Name"] == "TOTAL"].iloc[0]
+    assert pd.isna(failed_row[NODE_RUN_TIME])
+    assert total_row[NODE_RUN_TIME] == 2.0
