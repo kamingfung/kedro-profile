@@ -29,8 +29,8 @@ comprehensive reports.
 
 import os
 import tempfile
+import threading
 import time
-from collections import defaultdict
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -39,6 +39,7 @@ import pytest
 from pandas.testing import assert_frame_equal
 
 from kedro_profile.hook import (
+    EXECUTION_ORDER,
     LOAD_COUNT,
     LOAD_TIME,
     NODE_RUN_TIME,
@@ -72,8 +73,8 @@ def test_profile_hook_initialization_default_values():
     assert isinstance(hook.dataset_profile_path, str)
     assert "node_profile_" in hook.node_profile_path
     assert "dataset_profile_" in hook.dataset_profile_path
-    assert isinstance(hook._dataset_profile, defaultdict)
-    assert isinstance(hook._node_profile, defaultdict)
+    assert hook._node_starts == {}
+    assert hook._load_durations == {}
     assert isinstance(hook._pipeline_start, float)
 
 
@@ -190,10 +191,10 @@ def test_node_profiling_complete_cycle():
     hook.after_node_run(node=mock_node, catalog=mock_catalog, inputs=mock_inputs)
 
     # Assert
-    assert "test_node" in hook._node_profile
-    assert NODE_RUN_TIME in hook._node_profile["test_node"]
-    assert isinstance(hook._node_profile["test_node"][NODE_RUN_TIME], float)
-    assert hook._node_profile["test_node"][NODE_RUN_TIME] > 0
+    node_profile, _ = hook._collect_profiles()
+    assert "test_node" in node_profile
+    assert isinstance(node_profile["test_node"][NODE_RUN_TIME], float)
+    assert node_profile["test_node"][NODE_RUN_TIME] > 0
 
 
 def test_node_profiling_disabled():
@@ -219,7 +220,8 @@ def test_node_profiling_disabled():
     hook.after_node_run(node=mock_node, catalog=mock_catalog, inputs=mock_inputs)
 
     # Assert
-    assert "test_node" not in hook._node_profile
+    assert hook._node_starts == {}
+    assert hook._node_durations == {}
 
 
 def test_dataset_profiling_load_cycle():
@@ -244,15 +246,13 @@ def test_dataset_profiling_load_cycle():
     hook.after_dataset_loaded(dataset_name=dataset_name, node=mock_node)
 
     # Assert
-    assert dataset_name in hook._dataset_profile
-    assert LOAD_TIME in hook._dataset_profile[dataset_name]
-    assert LOAD_COUNT in hook._dataset_profile[dataset_name]
-    assert hook._dataset_profile[dataset_name][LOAD_COUNT] == 1
-    assert isinstance(hook._dataset_profile[dataset_name][LOAD_TIME], float)
-    assert hook._dataset_profile[dataset_name][LOAD_TIME] > 0
+    node_profile, dataset_profile = hook._collect_profiles()
+    assert dataset_profile[dataset_name][LOAD_COUNT] == 1
+    assert isinstance(dataset_profile[dataset_name][LOAD_TIME], float)
+    assert dataset_profile[dataset_name][LOAD_TIME] > 0
 
     # Check node profile is also updated
-    assert LOAD_TIME in hook._node_profile["test_node"]
+    assert LOAD_TIME in node_profile["test_node"]
 
 
 def test_dataset_profiling_save_cycle():
@@ -276,12 +276,10 @@ def test_dataset_profiling_save_cycle():
     hook.after_dataset_saved(dataset_name=dataset_name, node=mock_node)
 
     # Assert
-    assert dataset_name in hook._dataset_profile
-    assert SAVE_TIME in hook._dataset_profile[dataset_name]
-    assert SAVE_COUNT in hook._dataset_profile[dataset_name]
-    assert hook._dataset_profile[dataset_name][SAVE_COUNT] == 1
-    assert isinstance(hook._dataset_profile[dataset_name][SAVE_TIME], float)
-    assert hook._dataset_profile[dataset_name][SAVE_TIME] > 0
+    _, dataset_profile = hook._collect_profiles()
+    assert dataset_profile[dataset_name][SAVE_COUNT] == 1
+    assert isinstance(dataset_profile[dataset_name][SAVE_TIME], float)
+    assert dataset_profile[dataset_name][SAVE_TIME] > 0
 
 
 def test_dataset_multiple_operations():
@@ -297,23 +295,26 @@ def test_dataset_multiple_operations():
     # Arrange
     hook = ProfileHook()
     dataset_name = "multi_access_dataset"
-    mock_node = Mock()
-    mock_node.name = "test_node"
+    node_a = Mock()
+    node_a.name = "node_a"
+    node_b = Mock()
+    node_b.name = "node_b"
 
-    # Act - Load dataset twice
-    for _ in range(2):
+    # Act - Load dataset from two nodes
+    for mock_node in (node_a, node_b):
         hook.before_dataset_loaded(dataset_name=dataset_name, node=mock_node)
         time.sleep(0.01)
         hook.after_dataset_loaded(dataset_name=dataset_name, node=mock_node)
 
     # Save dataset once
-    hook.before_dataset_saved(dataset_name=dataset_name, node=mock_node)
+    hook.before_dataset_saved(dataset_name=dataset_name, node=node_a)
     time.sleep(0.01)
-    hook.after_dataset_saved(dataset_name=dataset_name, node=mock_node)
+    hook.after_dataset_saved(dataset_name=dataset_name, node=node_a)
 
     # Assert
-    assert hook._dataset_profile[dataset_name][LOAD_COUNT] == 2
-    assert hook._dataset_profile[dataset_name][SAVE_COUNT] == 1
+    _, dataset_profile = hook._collect_profiles()
+    assert dataset_profile[dataset_name][LOAD_COUNT] == 2
+    assert dataset_profile[dataset_name][SAVE_COUNT] == 1
 
 
 def test_pipeline_run_complete_cycle():
@@ -333,8 +334,10 @@ def test_pipeline_run_complete_cycle():
     mock_run_result = Mock()
 
     # Add some test data
-    hook._node_profile["test_node"] = {NODE_RUN_TIME: 1.5}
-    hook._dataset_profile["test_dataset"] = {LOAD_TIME: 0.5, SAVE_TIME: 0.3}
+    hook._node_starts["test_node"] = 1.0
+    hook._node_durations["test_node"] = 1.5
+    hook._load_durations[("test_dataset", "test_node")] = 0.5
+    hook._save_durations[("test_dataset", "test_node")] = 0.3
 
     # Act
     with patch("builtins.print") as mock_print:
@@ -386,8 +389,8 @@ def test_node_error_handling_with_partial_results():
         )
 
     # Assert
-    assert NODE_RUN_TIME in hook._node_profile["failing_node"]
-    assert hook._node_profile["failing_node"][NODE_RUN_TIME] > 0
+    node_profile, _ = hook._collect_profiles()
+    assert pd.isna(node_profile["failing_node"][NODE_RUN_TIME])
     mock_save.assert_called_once()
 
 
@@ -653,8 +656,9 @@ def test_after_pipeline_run_output_variations(save_file: bool, rich_enabled: boo
             mock_import.return_value = rich_enabled
             hook = ProfileHook(save_file=save_file)
 
-    hook._node_profile["test_node"] = {NODE_RUN_TIME: 1.0}
-    hook._dataset_profile["test_dataset"] = {LOAD_TIME: 0.5}
+    hook._node_starts["test_node"] = 1.0
+    hook._node_durations["test_node"] = 1.0
+    hook._load_durations[("test_dataset", "test_node")] = 0.5
 
     mock_run_params = {"env": "test"}
     mock_run_result = Mock()
@@ -774,13 +778,9 @@ def test_integration_full_pipeline_simulation():
         assert hook.dataset_profile_path.exists()
 
         # Verify profiling data was collected
-        assert len(hook._node_profile) == 2
-        assert len(hook._dataset_profile) == 3
-        assert "data_preprocessing" in hook._node_profile
-        assert "model_training" in hook._node_profile
-        assert "raw_data" in hook._dataset_profile
-        assert "processed_data" in hook._dataset_profile
-        assert "model_output" in hook._dataset_profile
+        node_profile, dataset_profile = hook._collect_profiles()
+        assert set(node_profile) == {"data_preprocessing", "model_training"}
+        assert set(dataset_profile) == {"raw_data", "processed_data", "model_output"}
 
 
 def test_dataset_hooks_noop_when_disabled() -> None:
@@ -796,5 +796,60 @@ def test_dataset_hooks_noop_when_disabled() -> None:
         hook.before_dataset_saved("output_data", test_node)
         hook.after_dataset_saved("output_data", test_node)
 
-    assert hook._dataset_profile == {}
-    assert hook._node_profile == {}
+    assert hook._load_starts == {}
+    assert hook._load_durations == {}
+    assert hook._save_starts == {}
+    assert hook._save_durations == {}
+    assert hook._collect_profiles() == ({}, {})
+
+
+def test_concurrent_loads_of_same_dataset_give_correct_totals() -> None:
+    """Two nodes loading one dataset at once sum to the right dataset total."""
+    # Arrange
+    hook = ProfileHook()
+    nodes = []
+    for name in ("node_a", "node_b"):
+        mock_node = Mock()
+        mock_node.name = name
+        nodes.append(mock_node)
+    barrier = threading.Barrier(len(nodes))
+
+    def load(mock_node: Mock) -> None:
+        hook.before_node_run(node=mock_node, catalog=Mock(), inputs={})
+        barrier.wait()
+        hook.before_dataset_loaded(dataset_name="shared", node=mock_node)
+        time.sleep(0.05)
+        hook.after_dataset_loaded(dataset_name="shared", node=mock_node)
+        hook.after_node_run(node=mock_node, catalog=Mock(), inputs={})
+
+    # Act
+    threads = [threading.Thread(target=load, args=(n,)) for n in nodes]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    node_profile, dataset_profile = hook._collect_profiles()
+
+    # Assert
+    per_node = [node_profile[n][LOAD_TIME] for n in ("node_a", "node_b")]
+    assert dataset_profile["shared"][LOAD_COUNT] == 2
+    assert dataset_profile["shared"][LOAD_TIME] == pytest.approx(sum(per_node))
+    assert all(duration >= 0.05 for duration in per_node)
+
+
+def test_execution_order_follows_start_times() -> None:
+    """Execution order is the rank of each node's start time."""
+    # Arrange
+    hook = ProfileHook()
+    late, early = Mock(), Mock()
+    late.name = "late"
+    early.name = "early"
+    hook._node_starts["late"] = 20.0
+    hook._node_starts["early"] = 10.0  # inserted second, started first
+
+    # Act
+    node_profile, _ = hook._collect_profiles()
+
+    # Assert
+    assert node_profile["early"][EXECUTION_ORDER] == 1
+    assert node_profile["late"][EXECUTION_ORDER] == 2

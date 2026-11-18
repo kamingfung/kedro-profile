@@ -1,8 +1,6 @@
 import importlib
 import os
-import threading
 import time
-from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -56,7 +54,7 @@ class ProfileHook:
         Sets up internal state for profiling including:
         - Rich output formatting configuration
         - Enable/disable state based on environment variables
-        - Profile data structures for nodes and datasets
+        - Per-key timing records for nodes and datasets
         - Pipeline start time tracking
         """
         if os.environ.get("KEDRO_PROFILE_RICH") == "0":
@@ -73,15 +71,25 @@ class ProfileHook:
         else:
             self.disable = False
 
-        self._dataset_profile: defaultdict[str, dict[str, Any]] = defaultdict(
-            lambda: {}
-        )
-        self._node_profile: defaultdict[str, dict[str, Any]] = defaultdict(lambda: {})
-        self._load_starts: dict[tuple[int, str, str], float] = {}
-        self._save_starts: dict[tuple[int, str, str], float] = {}
+        self._reset_run_state()
+
+    def _reset_run_state(self) -> None:
+        """Clear all timing records so a new run starts fresh.
+
+        Every record is stored under its own key and written by one thread
+        only (a node runs once, in one thread), so no lock is needed. Totals
+        are computed once at the end of the run in ``_collect_profiles``.
+        """
+        # node name -> epoch start time, and node name -> compute seconds
+        self._node_starts: dict[str, float] = {}
+        self._node_durations: dict[str, float] = {}
+        # (dataset name, node name) -> epoch start time / seconds
+        self._load_starts: dict[tuple[str, str], float] = {}
+        self._load_durations: dict[tuple[str, str], float] = {}
+        self._save_starts: dict[tuple[str, str], float] = {}
+        self._save_durations: dict[tuple[str, str], float] = {}
 
         self._pipeline_start: float = time.time()
-        self._node_execution_order: int = 0
 
     def __hash__(self) -> int:
         """Return hash of the ProfileHook instance.
@@ -113,6 +121,44 @@ class ProfileHook:
         """
         print(f"Profile data saved to: {file_path}")
 
+    def _collect_profiles(
+        self,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        """Compute node and dataset profiles from the per-key timing records.
+
+        Runs once at the end of a run (or when saving partial results), so it
+        is the only place that sums durations or counts loads and saves.
+
+        Returns:
+            Tuple of (node profile, dataset profile) dictionaries keyed by name.
+        """
+        node_profile: dict[str, dict[str, Any]] = {}
+        dataset_profile: dict[str, dict[str, Any]] = {}
+
+        # list() snapshots the dicts: other threads may still be writing
+        by_start = sorted(list(self._node_starts.items()), key=lambda item: item[1])
+        for order, (node_name, _) in enumerate(by_start, start=1):
+            node_profile[node_name] = {
+                EXECUTION_ORDER: order,
+                NODE_RUN_TIME: self._node_durations.get(node_name, float("nan")),
+            }
+
+        for durations, time_col, count_col in (
+            (list(self._load_durations.items()), LOAD_TIME, LOAD_COUNT),
+            (list(self._save_durations.items()), SAVE_TIME, SAVE_COUNT),
+        ):
+            for (dataset_name, node_name), duration in durations:
+                for profile, name in (
+                    (dataset_profile, dataset_name),
+                    (node_profile, node_name),
+                ):
+                    entry = profile.setdefault(name, {})
+                    entry[time_col] = entry.get(time_col, 0) + duration
+                dataset_entry = dataset_profile[dataset_name]
+                dataset_entry[count_col] = dataset_entry.get(count_col, 0) + 1
+
+        return node_profile, dataset_profile
+
     def save_partial_results(self) -> None:
         """Save partial results to CSV files.
 
@@ -125,10 +171,9 @@ class ProfileHook:
         self._total_time = time.time() - self._pipeline_start
 
         # Build DataFrames for both node and dataset profiles
-        node_df = _build_node_table(self._node_profile, index_name="Node Name")
-        dataset_df = _build_dataset_table(
-            self._dataset_profile, index_name="Dataset Name"
-        )
+        node_profile, dataset_profile = self._collect_profiles()
+        node_df = _build_node_table(node_profile, index_name="Node Name")
+        dataset_df = _build_dataset_table(dataset_profile, index_name="Dataset Name")
 
         # Save to CSV files
         self._save_to_csv(node_df, self.node_profile_path)
@@ -151,9 +196,7 @@ class ProfileHook:
         if self.disable:
             return
 
-        self._node_execution_order += 1
-        self._node_profile[node.name][EXECUTION_ORDER] = self._node_execution_order
-        self._node_profile[node.name][NODE_RUN_TIME] = time.time()
+        self._node_starts[node.name] = time.time()
 
     @hook_impl
     def after_node_run(
@@ -168,9 +211,7 @@ class ProfileHook:
         """
         if self.disable:
             return
-        self._node_profile[node.name][NODE_RUN_TIME] = (
-            time.time() - self._node_profile[node.name][NODE_RUN_TIME]
-        )
+        self._node_durations[node.name] = time.time() - self._node_starts[node.name]
 
     @hook_impl
     def on_node_error(
@@ -193,12 +234,6 @@ class ProfileHook:
         if self.disable:
             return
 
-        # Calculate partial node time if it was started
-        if NODE_RUN_TIME in self._node_profile[node.name]:
-            self._node_profile[node.name][NODE_RUN_TIME] = (
-                time.time() - self._node_profile[node.name][NODE_RUN_TIME]
-            )
-
         # Save partial results when a node fails
         self.save_partial_results()
 
@@ -213,12 +248,11 @@ class ProfileHook:
         """
         if self.disable:
             return
-        key = (threading.get_ident(), dataset_name, node.name)
-        self._load_starts[key] = time.time()
+        self._load_starts[(dataset_name, node.name)] = time.time()
 
     @hook_impl
     def after_dataset_loaded(self, dataset_name: str, node: Node) -> None:
-        """Calculate and accumulate dataset loading time.
+        """Record the dataset loading time under its own key.
 
         Args:
             dataset_name: Name of the dataset that was loaded.
@@ -226,21 +260,8 @@ class ProfileHook:
         """
         if self.disable:
             return
-        now = time.time()
-        key = (threading.get_ident(), dataset_name, node.name)
-        start = self._load_starts.pop(key, now)
-        load_duration = now - start
-
-        # Accumulate the duration instead of overwriting
-        self._dataset_profile[dataset_name][LOAD_TIME] = (
-            self._dataset_profile[dataset_name].get(LOAD_TIME, 0) + load_duration
-        )
-        self._node_profile[node.name][LOAD_TIME] = (
-            self._node_profile[node.name].get(LOAD_TIME, 0) + load_duration
-        )
-        self._dataset_profile[dataset_name][LOAD_COUNT] = (
-            self._dataset_profile[dataset_name].get(LOAD_COUNT, 0) + 1
-        )
+        key = (dataset_name, node.name)
+        self._load_durations[key] = time.time() - self._load_starts[key]
 
     @hook_impl
     def before_dataset_saved(self, dataset_name: str, node: Node) -> None:
@@ -252,12 +273,11 @@ class ProfileHook:
         """
         if self.disable:
             return
-        key = (threading.get_ident(), dataset_name, node.name)
-        self._save_starts[key] = time.time()
+        self._save_starts[(dataset_name, node.name)] = time.time()
 
     @hook_impl
     def after_dataset_saved(self, dataset_name: str, node: Node) -> None:
-        """Calculate and accumulate dataset saving time.
+        """Record the dataset saving time under its own key.
 
         Args:
             dataset_name: Name of the dataset that was saved.
@@ -265,21 +285,8 @@ class ProfileHook:
         """
         if self.disable:
             return
-        now = time.time()
-        key = (threading.get_ident(), dataset_name, node.name)
-        start = self._save_starts.pop(key, now)
-        save_duration = now - start
-
-        # Accumulate the duration instead of overwriting
-        self._dataset_profile[dataset_name][SAVE_TIME] = (
-            self._dataset_profile[dataset_name].get(SAVE_TIME, 0) + save_duration
-        )
-        self._node_profile[node.name][SAVE_TIME] = (
-            self._node_profile[node.name].get(SAVE_TIME, 0) + save_duration
-        )
-        self._dataset_profile[dataset_name][SAVE_COUNT] = (
-            self._dataset_profile[dataset_name].get(SAVE_COUNT, 0) + 1
-        )
+        key = (dataset_name, node.name)
+        self._save_durations[key] = time.time() - self._save_starts[key]
 
     @hook_impl
     def before_pipeline_run(
@@ -344,10 +351,9 @@ class ProfileHook:
         self._total_time = time.time() - self._pipeline_start
 
         # Build DataFrames for both node and dataset profiles
-        node_df = _build_node_table(self._node_profile, index_name="Node Name")
-        dataset_df = _build_dataset_table(
-            self._dataset_profile, index_name="Dataset Name"
-        )
+        node_profile, dataset_profile = self._collect_profiles()
+        node_df = _build_node_table(node_profile, index_name="Node Name")
+        dataset_df = _build_dataset_table(dataset_profile, index_name="Dataset Name")
 
         # Save to CSV files if enabled
         if self.save_file:
