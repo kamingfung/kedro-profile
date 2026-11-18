@@ -49,6 +49,7 @@ from kedro_profile.hook import (
     ProfileHook,
     _build_dataset_table,
     _add_total_row,
+    _add_wall_clock_row,
     _build_node_table,
     dataframe_to_rich_table,
     print_rich_table_to_console,
@@ -896,3 +897,30 @@ def test_unfinished_node_has_no_compute_time_and_stays_out_of_total() -> None:
     total_row = with_total[with_total["Node Name"] == "TOTAL"].iloc[0]
     assert pd.isna(failed_row[NODE_RUN_TIME])
     assert total_row[NODE_RUN_TIME] == 2.0
+
+
+def test_rich_table_with_summary_rows_formats_every_numeric_column() -> None:
+    """TOTAL and Time Elapsed rows keep numeric dtypes, so formatting applies."""
+    # Arrange
+    node_df = _build_node_table(
+        dictionary={
+            "n1": {EXECUTION_ORDER: 1, LOAD_TIME: 1.0, NODE_RUN_TIME: 2.0},
+            "n2": {EXECUTION_ORDER: 2, LOAD_TIME: 0.5, NODE_RUN_TIME: 1.5},
+        },
+        index_name="Node Name",
+    )
+    with_rows = _add_total_row(node_df, "Node Name")
+    with_rows = _add_wall_clock_row(with_rows, "Node Name", 4.0)
+
+    # Act
+    rich_table = dataframe_to_rich_table(df=with_rows)
+
+    # Assert
+    numeric_cols = [EXECUTION_ORDER, LOAD_TIME, NODE_RUN_TIME, SAVE_TIME, TOTAL_TIME]
+    for col in numeric_cols:
+        assert pd.api.types.is_numeric_dtype(with_rows[col]), col
+    columns = {column.header: column for column in rich_table.columns}
+    assert all(columns[col].justify == "right" for col in numeric_cols)
+    assert list(columns[NODE_RUN_TIME]._cells) == ["2.00", "1.50", "3.50", ""]
+    assert list(columns[EXECUTION_ORDER]._cells) == ["1", "2", "", ""]
+    assert list(columns[TOTAL_TIME]._cells) == ["3.00", "2.00", "5.00", "4.00"]

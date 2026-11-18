@@ -428,12 +428,12 @@ def dataframe_to_rich_table(df: pd.DataFrame) -> Table:
             if is_integer_col:
                 # Format integers with thousands separators, no decimal places
                 df_formatted[col] = df_formatted[col].apply(
-                    lambda x: f"{int(x):,}" if pd.notna(x) else str(x)
+                    lambda x: f"{int(x):,}" if pd.notna(x) else ""
                 )
             else:
                 # Format floats with thousands separators and 2 decimal places
                 df_formatted[col] = df_formatted[col].apply(
-                    lambda x: f"{x:,.2f}" if pd.notna(x) else str(x)
+                    lambda x: f"{x:,.2f}" if pd.notna(x) else ""
                 )
             # Add column with right alignment for numeric columns
             table.add_column(col, justify="right")
@@ -499,7 +499,7 @@ def _build_node_table(
     )
     if EXECUTION_ORDER not in df.columns:
         df[EXECUTION_ORDER] = 0
-    df[EXECUTION_ORDER] = df[EXECUTION_ORDER].fillna(0).astype(int)
+    df[EXECUTION_ORDER] = df[EXECUTION_ORDER].fillna(0).astype("Int64")
     return df[
         [
             "Execution Order",
@@ -523,9 +523,9 @@ def _build_dataset_table(
         time_cols=[LOAD_TIME, SAVE_TIME],
     )
     if LOAD_COUNT in df.columns:
-        df[LOAD_COUNT] = df[LOAD_COUNT].fillna(0).astype(int)
+        df[LOAD_COUNT] = df[LOAD_COUNT].fillna(0).astype("Int64")
     if SAVE_COUNT in df.columns:
-        df[SAVE_COUNT] = df[SAVE_COUNT].fillna(0).astype(int)
+        df[SAVE_COUNT] = df[SAVE_COUNT].fillna(0).astype("Int64")
     return df
 
 
@@ -545,7 +545,8 @@ def _append_summary_row(
         df: DataFrame containing profiling data.
         index_col_name: Name of the index column (receives the label).
         label: Text placed in the index column (e.g. "TOTAL").
-        col_value_fn: Callable(col, df) -> value for each non-index column.
+        col_value_fn: Callable(col, df) -> value for each non-index column;
+            None leaves the cell empty (NaN) so numeric columns stay numeric.
 
     Returns:
         New DataFrame with the summary row appended.
@@ -559,7 +560,11 @@ def _append_summary_row(
             continue
         row[col] = col_value_fn(col, df)
 
-    return pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    row_df = pd.DataFrame([row], columns=df.columns)
+    for col in df.columns:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            row_df[col] = row_df[col].astype(df[col].dtype)
+    return pd.concat([df, row_df], ignore_index=True)
 
 
 def _add_total_row(df: pd.DataFrame, index_col_name: str) -> pd.DataFrame:
@@ -568,7 +573,7 @@ def _add_total_row(df: pd.DataFrame, index_col_name: str) -> pd.DataFrame:
 
     Creates a summary row labeled "TOTAL (sum of nodes)" that aggregates
     numeric values across all rows. Special handling for execution order
-    (left blank) and human-readable time fields.
+    (left empty) and human-readable time fields.
 
     Args:
         df: DataFrame containing profiling data.
@@ -580,15 +585,15 @@ def _add_total_row(df: pd.DataFrame, index_col_name: str) -> pd.DataFrame:
 
     def _col_value(col: str, source_df: pd.DataFrame) -> Any:
         if col == EXECUTION_ORDER:
-            return ""
+            return None
         if col == "Total Time":
             if TOTAL_TIME in source_df.columns:
                 total_seconds = source_df[TOTAL_TIME].sum()
                 return humanize.naturaldelta(total_seconds, minimum_unit="seconds")
-            return ""
+            return None
         if pd.api.types.is_numeric_dtype(source_df[col]):
             return round(source_df[col].sum(), 2)
-        return ""
+        return None
 
     return _append_summary_row(df, index_col_name, "TOTAL", _col_value)
 
@@ -617,6 +622,6 @@ def _add_wall_clock_row(
             return round(wall_clock_seconds, 2)
         if col == "Total Time":
             return humanize.naturaldelta(wall_clock_seconds, minimum_unit="seconds")
-        return ""
+        return None
 
     return _append_summary_row(df, index_col_name, "Time Elapsed", _col_value)
