@@ -304,6 +304,7 @@ class ProfileHook:
         """
         if self.disable:
             return
+        self._reset_run_state()
         self.run_env = run_params.get("env") if run_params.get("env") else "local"
 
     @hook_impl

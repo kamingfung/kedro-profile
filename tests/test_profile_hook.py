@@ -853,3 +853,25 @@ def test_execution_order_follows_start_times() -> None:
     # Assert
     assert node_profile["early"][EXECUTION_ORDER] == 1
     assert node_profile["late"][EXECUTION_ORDER] == 2
+
+
+def test_second_run_starts_fresh() -> None:
+    """before_pipeline_run clears records and the start time of the first run."""
+    # Arrange
+    hook = ProfileHook()
+    mock_node = Mock()
+    mock_node.name = "test_node"
+    run_args = {"run_params": {}, "pipeline": Mock(), "catalog": Mock()}
+    hook.before_pipeline_run(**run_args)
+    hook.before_node_run(node=mock_node, catalog=Mock(), inputs={})
+    hook.before_dataset_loaded(dataset_name="raw", node=mock_node)
+    hook.after_dataset_loaded(dataset_name="raw", node=mock_node)
+    hook.after_node_run(node=mock_node, catalog=Mock(), inputs={})
+    hook._pipeline_start -= 1000
+
+    # Act
+    hook.before_pipeline_run(**run_args)
+
+    # Assert
+    assert hook._collect_profiles() == ({}, {})
+    assert time.time() - hook._pipeline_start < 5
