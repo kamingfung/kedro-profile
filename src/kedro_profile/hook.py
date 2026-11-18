@@ -1,19 +1,23 @@
-import importlib
+from __future__ import annotations
+
 import os
 import time
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import humanize
 import pandas as pd
 from kedro.framework.hooks import hook_impl
-from kedro.io import DataCatalog
-from kedro.pipeline import Pipeline
-from kedro.pipeline.node import Node
 from rich.console import Console
 from rich.table import Table
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from kedro.io import DataCatalog
+    from kedro.pipeline import Pipeline
+    from kedro.pipeline.node import Node
 
 LOAD_COUNT = "Load Count"
 SAVE_COUNT = "Save Count"
@@ -60,11 +64,7 @@ class ProfileHook:
         if os.environ.get("KEDRO_PROFILE_RICH") == "0":
             self.rich_enabled = False
         else:
-            try:
-                importlib.import_module("rich")
-                self.rich_enabled = True
-            except ImportError:
-                self.rich_enabled = False
+            self.rich_enabled = True
 
         if os.environ.get("KEDRO_PROFILE_DISABLE") == "1":
             self.disable = True
@@ -474,8 +474,6 @@ def _build_profile_table(
 ) -> pd.DataFrame:
     """Build a sorted, rounded profiling DataFrame from raw timing metrics."""
     df = pd.DataFrame.from_dict(dict(dictionary), orient="index")
-    temp_cols = [col for col in df.columns if col.startswith("_temp_")]
-    df = df.drop(columns=temp_cols, errors="ignore")
     for col in time_cols:
         if col not in df.columns:
             df[col] = 0.0
